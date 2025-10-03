@@ -64,19 +64,32 @@ benign_file = './data/decimal/decimal_benign.csv'
 
 def read_and_clean(path_or_df):
     df = pd.read_csv(path_or_df) if isinstance(path_or_df, str) else path_or_df.copy()
-    # 쓰지 않을 수 있는 열 제거
-    df = df.drop(columns=['ID','category','specific_class'], errors='ignore')
-    # 필수 컬럼 확인
+    # ❌ 기존: df.drop(['ID','category','specific_class'], ...)
+    # ✅ ID는 보존, 기타 불필요 컬럼만 제거
+    df = df.drop(columns=['category','specific_class'], errors='ignore')
+
+    # 필수 컬럼 확인 (ID는 선택)
     use_cols = [f'DATA_{i}' for i in range(8)] + ['label']
     missing = [c for c in use_cols if c not in df.columns]
     if missing:
         raise ValueError(f"필수 컬럼 누락: {missing}")
+
     # 타입 캐스팅
     for c in [f'DATA_{i}' for i in range(8)]:
         df[c] = pd.to_numeric(df[c], errors='coerce').astype('float32')
+
     # 라벨 정규화 (공격:1, 정상:0)
     df['label'] = df['label'].astype(str).str.lower().map({'benign':0, '0':0, 'attack':1, '1':1})
+
+    # ID가 없으면 임시 ID 생성(시퀀스 묶음용)
+    if 'ID' not in df.columns:
+        df['ID'] = 'gid_' + (np.arange(len(df)) // 50).astype(str)  # 50개 단위로 같은 그룹
+
+    # (선택) 타임스탬프가 있으면 정규화용으로 보존
+    # 예상되는 이름들 중 하나가 있으면 그대로 둡니다.
+    # ['timestamp','time','ts'] 중 있는 컬럼만 사용
     return df
+
 
 # 공격/정상 CSV 로드 및 강제 라벨
 atk_df = pd.concat([pd.read_csv(f) for f in atk_files], ignore_index=True)
@@ -329,6 +342,286 @@ bnb.fit(X_train_bin2, y_train)
 prob_bnb = bnb.predict_proba(X_test_bin2)[:,1]
 metrics_report("BernoulliNB(binarized)", y_test, y_prob=prob_bnb)
 print("Best threshold by F1 (BernoulliNB):", best_threshold_by_f1(y_test, prob_bnb))
+
+
+# ============================
+# 10) LSTM (시퀀스 기반)
+# ============================
+print("\n== LSTM (sequence) ==")
+
+# A) 시퀀스 빌더: 같은 ID 안에서 연속 timesteps로 윈도 생성
+def build_sequences_df(df, features, label_col, group_col='ID',
+                       timesteps=10, step=1, timestamp_cols=('timestamp','time','ts')):
+    # 시간 정렬(가능하면)
+    ts_col = next((c for c in timestamp_cols if c in df.columns), None)
+    if ts_col is not None:
+        df_sorted = df.sort_values([group_col, ts_col], kind='mergesort')
+    else:
+        # 원래 섞은 상태라도 group 내 상대 순서를 유지(mergesort는 안정 정렬)
+        df_sorted = df.sort_values([group_col], kind='mergesort')
+
+    X_seq, y_seq, groups = [], [], []
+    for gid, g in df_sorted.groupby(group_col, sort=False):
+        Xg = g[features].values.astype('float32')
+        yg = g[label_col].values.astype('int32')
+        if len(g) < timesteps:  # 너무 짧으면 스킵
+            continue
+        # 슬라이딩 윈도우
+        for i in range(0, len(g) - timesteps + 1, step):
+            X_seq.append(Xg[i:i+timesteps])
+            # 레이블 집계: 윈도 내 하나라도 공격이면 1 (max)
+            y_seq.append(int(yg[i:i+timesteps].max()))
+            groups.append(gid)
+    return np.array(X_seq), np.array(y_seq), np.array(groups)
+
+TIMESTEPS = 10
+SEQ_FEATURES = [f'DATA_{i}' for i in range(8)]
+
+# 주의: 시퀀스는 "원본 df"에서 만듭니다(스케일은 나중에 적용)
+X_seq, y_seq, groups_seq = build_sequences_df(df, SEQ_FEATURES, 'label', group_col='ID',
+                                              timesteps=TIMESTEPS, step=1)
+
+print(f"Seq shapes: X_seq={X_seq.shape}, y_seq={y_seq.shape}, #groups={len(np.unique(groups_seq))}")
+
+# B) 그룹 기반 분할 (동일 ID가 train/test에 동시에 등장 금지)
+gss_seq = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=SEED)  # 80/20, 필요시 0.30로 변경
+tr_idx, te_idx = next(gss_seq.split(X_seq, y_seq, groups=groups_seq))
+Xtr, Xte = X_seq[tr_idx], X_seq[te_idx]
+ytr, yte = y_seq[tr_idx], y_seq[te_idx]
+grp_tr, grp_te = groups_seq[tr_idx], groups_seq[te_idx]
+assert len(set(grp_tr).intersection(set(grp_te))) == 0, "LSTM group leakage!"
+
+print(f"LSTM split: train={Xtr.shape}, test={Xte.shape}")
+
+# C) 시퀀스 스케일링 (train에 fit → test에만 transform)
+#    각 timestep의 피처 분포를 동일 기준으로 맞추기 위해 flatten→스케일→reshape
+scaler_seq = StandardScaler()
+Xtr_flat = Xtr.reshape(-1, Xtr.shape[2])
+Xte_flat = Xte.reshape(-1, Xte.shape[2])
+Xtr_flat = scaler_seq.fit_transform(Xtr_flat)
+Xte_flat = scaler_seq.transform(Xte_flat)
+Xtr = Xtr_flat.reshape(Xtr.shape)
+Xte = Xte_flat.reshape(Xte.shape)
+
+# D) 클래스 가중치
+classes = np.unique(ytr)
+cw = compute_class_weight('balanced', classes=classes, y=ytr)
+class_weight_seq = {int(c): w for c, w in zip(classes, cw)}
+
+# E) LSTM 모델(가볍게)
+from tensorflow.keras.layers import LSTM, Bidirectional
+
+tf.keras.utils.set_random_seed(SEED)
+lstm = Sequential([
+    Bidirectional(LSTM(64, return_sequences=True), input_shape=(Xtr.shape[1], Xtr.shape[2])),
+    Dropout(0.2),
+    LSTM(32),
+    Dense(1, activation='sigmoid')
+])
+lstm.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+es2 = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+lstm.fit(Xtr, ytr, epochs=30, batch_size=256, validation_split=0.2,
+         class_weight=class_weight_seq, callbacks=[es2], verbose=0)
+
+# F) 평가
+y_prob_lstm = lstm.predict(Xte, verbose=0).ravel()
+
+def report_seq(name, y_true, y_prob):
+    # 임계값 0.5 기준
+    y_pred = (y_prob >= 0.5).astype(int)
+    acc = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
+    aucv = roc_auc_score(y_true, y_prob)
+    print(f"[{name}] Acc={acc:.4f} Prec={prec:.4f} Rec={rec:.4f} F1={f1:.4f} ROC-AUC={aucv:.4f}")
+    cm = confusion_matrix(y_true, y_pred)
+    ConfusionMatrixDisplay(cm, display_labels=["Benign","Attack"]).plot(cmap=plt.cm.Oranges)
+    plt.title(f"{name} - Confusion Matrix"); plt.grid(False); plt.show()
+
+report_seq("LSTM(seq)", yte, y_prob_lstm)
+
+# G) F1 최적 임계값
+bt_lstm = best_threshold_by_f1(yte, y_prob_lstm)
+print("Best threshold by F1 (LSTM):", bt_lstm)
+
+# (선택) ROC/PR 곡선
+fpr, tpr, _ = roc_curve(yte, y_prob_lstm)
+plt.plot(fpr, tpr); plt.plot([0,1],[0,1],'--'); plt.xlabel("FPR"); plt.ylabel("TPR")
+plt.title("LSTM ROC Curve"); plt.grid(True); plt.show()
+
+precv, recv, _ = precision_recall_curve(yte, y_prob_lstm)
+plt.plot(recv, precv); plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("LSTM PR Curve")
+plt.grid(True); plt.show()
+
+
+# ============================
+# 10) Improved LSTM (sequence + ID embedding + clean labeling)
+# ============================
+print("\n== LSTM (sequence, improved) ==")
+
+# ── A) 시퀀스/라벨 설정값
+TIMESTEPS   = 20     # 윈도 길이 (10~50 사이 튜닝)
+STEP        = 1      # 슬라이딩 간격
+LABEL_RULE  = "ratio"  # 'last' | 'any' | 'ratio' (권장: 'ratio')
+POS_RATIO   = 0.3    # LABEL_RULE='ratio'일 때 양성 비율 임계값
+ADD_CONTEXT = True   # diff/rolling 등 경량 시계열 피처 추가 여부
+
+# ── B) 시퀀스용 데이터프레임: 전역 셔플 없는 "원본 순서" 유지
+#     -> 위쪽에서 read_and_clean 후 만든 atk_df, benign_df를 사용 (ID 보존 전제)
+df_seq = pd.concat([atk_df, benign_df], ignore_index=True)
+
+# (선택) 간단한 시간 맥락 피처 추가: ID 그룹 내 diff/rolling
+if ADD_CONTEXT:
+    # 시간 정렬 우선 (timestamp 컬럼이 있으면 사용)
+    ts_col = next((c for c in ['timestamp','time','ts'] if c in df_seq.columns), None)
+    sort_cols = ['ID'] + ([ts_col] if ts_col is not None else [])
+    df_seq = df_seq.sort_values(sort_cols, kind='mergesort')
+
+    base_feats = [f'DATA_{i}' for i in range(8)]
+    for c in base_feats:
+        df_seq[f'{c}_diff1']       = df_seq.groupby('ID')[c].diff(1)
+        df_seq[f'{c}_roll5_mean'] = (
+            df_seq.groupby('ID')[c].rolling(5).mean().reset_index(level=0, drop=True)
+        )
+        df_seq[f'{c}_roll5_std'] = (
+            df_seq.groupby('ID')[c].rolling(5).std().reset_index(level=0, drop=True)
+        )
+    df_seq = df_seq.fillna(0.0)
+    SEQ_FEATURES = base_feats + [f'{c}_diff1' for c in base_feats] + \
+                   [f'{c}_roll5_mean' for c in base_feats] + [f'{c}_roll5_std' for c in base_feats]
+else:
+    SEQ_FEATURES = [f'DATA_{i}' for i in range(8)]
+
+# ── C) ID 인덱스 생성 (임베딩 입력용)
+id2idx = {idv:i for i, idv in enumerate(df_seq['ID'].astype(str).unique())}
+df_seq['id_idx'] = df_seq['ID'].astype(str).map(id2idx).astype('int32')
+NUM_IDS = len(id2idx)
+
+# ── D) 시퀀스 빌더
+def build_sequences_df(df, features, label_col, id_idx_col='id_idx',
+                       timesteps=10, step=1):
+    # 시간 정렬(가능하면)
+    ts_col = next((c for c in ['timestamp','time','ts'] if c in df.columns), None)
+    sort_cols = ['ID'] + ([ts_col] if ts_col is not None else [])
+    df_sorted = df.sort_values(sort_cols, kind='mergesort')
+
+    X_seq, y_seq, groups, id_seq = [], [], [], []
+    for gid, g in df_sorted.groupby('ID', sort=False):
+        Xg = g[features].values.astype('float32')
+        yg = g[label_col].values.astype('int32')
+        ig = g[id_idx_col].values.astype('int32')
+
+        if len(g) < timesteps:  # 너무 짧은 건 스킵
+            continue
+
+        # 슬라이딩 윈도우
+        for i in range(0, len(g) - timesteps + 1, step):
+            Xw = Xg[i:i+timesteps]
+            yw = yg[i:i+timesteps]
+            # 라벨링 규칙
+            if LABEL_RULE == 'last':
+                ylab = int(yw[-1])
+            elif LABEL_RULE == 'any':
+                ylab = int(yw.max())
+            else:  # 'ratio'
+                ylab = int(yw.mean() >= POS_RATIO)
+
+            X_seq.append(Xw)
+            y_seq.append(ylab)
+            groups.append(gid)
+            id_seq.append(ig[0])   # 윈도 내 ID는 동일
+
+    return np.array(X_seq), np.array(y_seq), np.array(groups), np.array(id_seq)
+
+X_seq, y_seq, grp_seq, id_seq = build_sequences_df(
+    df_seq, SEQ_FEATURES, 'label', timesteps=TIMESTEPS, step=STEP
+)
+
+print(f"Seq shapes: X_seq={X_seq.shape}, y_seq={y_seq.shape}, #unique_IDs={NUM_IDS}")
+
+# ── E) 그룹 분할(누수 방지: 동일 ID는 한쪽에만)
+gss_seq = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=SEED)  # 필요시 0.30로
+tr_idx, te_idx = next(gss_seq.split(X_seq, y_seq, groups=grp_seq))
+
+Xtr, Xte = X_seq[tr_idx], X_seq[te_idx]
+ytr, yte = y_seq[tr_idx], y_seq[te_idx]
+idtr, idte = id_seq[tr_idx], id_seq[te_idx]
+grp_tr, grp_te = grp_seq[tr_idx], grp_seq[te_idx]
+assert len(set(grp_tr).intersection(set(grp_te))) == 0, "LSTM group leakage!"
+
+print(f"LSTM split: train={Xtr.shape}, test={Xte.shape}, ids(train/test)={len(np.unique(idtr))}/{len(np.unique(idte))}")
+
+# ── F) 스케일링 (train에 fit → test에만 transform)
+from sklearn.preprocessing import StandardScaler
+scaler_seq = StandardScaler(with_mean=True, with_std=True)
+Xtr_flat = Xtr.reshape(-1, Xtr.shape[2])
+Xte_flat = Xte.reshape(-1, Xte.shape[2])
+Xtr_flat = scaler_seq.fit_transform(Xtr_flat)
+Xte_flat = scaler_seq.transform(Xte_flat)
+Xtr = Xtr_flat.reshape(Xtr.shape)
+Xte = Xte_flat.reshape(Xte.shape)
+
+# ── G) 클래스 가중치
+classes = np.unique(ytr)
+cw = compute_class_weight('balanced', classes=classes, y=ytr)
+class_weight_seq = {int(c): w for c, w in zip(classes, cw)}
+
+# ── H) 모델(시퀀스 + ID 임베딩 결합)
+from tensorflow.keras import Model
+from tensorflow.keras.layers import LSTM, Bidirectional, Dropout, Dense, Input, Embedding, Flatten, Concatenate
+
+tf.keras.utils.set_random_seed(SEED)
+
+seq_in = Input(shape=(Xtr.shape[1], Xtr.shape[2]), name='seq_in')
+id_in  = Input(shape=(), dtype='int32', name='id_in')
+
+x = Bidirectional(LSTM(64, return_sequences=True))(seq_in)
+x = Dropout(0.2)(x)
+x = LSTM(32)(x)
+
+# ID embedding (작게 16차원; 데이터에 맞춰 8~32 튜닝)
+id_emb = Embedding(input_dim=NUM_IDS, output_dim=16, name='id_emb')(id_in)
+id_emb = Flatten()(id_emb)
+
+h = Concatenate()([x, id_emb])
+h = Dense(64, activation='relu')(h)
+out = Dense(1, activation='sigmoid')(h)
+
+lstm_model = Model(inputs=[seq_in, id_in], outputs=out)
+lstm_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+es2 = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+lstm_model.fit([Xtr, idtr], ytr, epochs=30, batch_size=256, validation_split=0.2,
+               class_weight=class_weight_seq, callbacks=[es2], verbose=0)
+
+# ── I) 평가 + 임계값 튜닝
+y_prob_lstm = lstm_model.predict([Xte, idte], verbose=0).ravel()
+
+def report_seq(name, y_true, y_prob, thr=0.5):
+    y_pred = (y_prob >= thr).astype(int)
+    acc = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
+    aucv = roc_auc_score(y_true, y_prob)
+    print(f"[{name}] Thr={thr:.3f}  Acc={acc:.4f}  Prec={prec:.4f}  Rec={rec:.4f}  F1={f1:.4f}  ROC-AUC={aucv:.4f}")
+    cm = confusion_matrix(y_true, y_pred)
+    ConfusionMatrixDisplay(cm, display_labels=["Benign","Attack"]).plot(cmap=plt.cm.Oranges)
+    plt.title(f"{name} - Confusion Matrix"); plt.grid(False); plt.show()
+
+# 기본 0.5 평가
+report_seq("LSTM(seq+ID)", yte, y_prob_lstm, thr=0.5)
+
+# F1 최대 임계값
+bt_lstm = best_threshold_by_f1(yte, y_prob_lstm)
+print("Best threshold by F1 (LSTM):", bt_lstm)
+report_seq("LSTM(seq+ID)-bestF1", yte, y_prob_lstm, thr=bt_lstm['threshold'])
+
+# (선택) ROC / PR
+fpr, tpr, _ = roc_curve(yte, y_prob_lstm)
+plt.plot(fpr, tpr); plt.plot([0,1],[0,1],'--'); plt.xlabel("FPR"); plt.ylabel("TPR")
+plt.title("LSTM ROC Curve"); plt.grid(True); plt.show()
+
+precv, recv, _ = precision_recall_curve(yte, y_prob_lstm)
+plt.plot(recv, precv); plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("LSTM PR Curve")
+plt.grid(True); plt.show()
+
 
 # -----------------------------
 # 9) 누수 재확인 (정확 행 중복 수)
