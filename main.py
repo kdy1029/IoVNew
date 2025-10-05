@@ -12,7 +12,7 @@ CAN-IDS: Decimal 데이터셋 (DATA_0..7) 이진 분류
 """
 
 import os, random, hashlib
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # CPU 고정 (GPU 비교시 주석 처리)
+#os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # CPU 고정 (GPU 비교시 주석 처리)
 
 import numpy as np
 import pandas as pd
