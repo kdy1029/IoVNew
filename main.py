@@ -146,19 +146,18 @@ X_test  = scaler.transform(X_test)
 # -----------------------------
 # 4) 평가지표/리포팅 유틸
 # -----------------------------
-def metrics_report(name, y_true, y_prob=None, y_pred=None, plot_cm=True):
+def metrics_report(name, y_true, y_prob=None, y_pred=None, plot_cm=True, thr=None):
     if y_pred is None:
         if y_prob is None:
             raise ValueError("y_prob 또는 y_pred 중 하나는 필요합니다.")
         # 선형점수(decision_function)를 그대로 쓸 수도 있으므로 확률이 아닐 수 있음에 유의
         # 분류는 0.5 기준(또는 0 점수 기준)으로 처리
-        if y_prob.ndim == 1:
-            # decision score 또는 1D proba
-            # score일 경우 threshold=0, proba일 경우 threshold=0.5
-            thr = 0.0 if (y_prob.min() < 0 or y_prob.max() > 1) else 0.5
+        if thr is not None:
             y_pred = (y_prob >= thr).astype(int)
         else:
-            y_pred = np.argmax(y_prob, axis=1)
+            # 기본: 확률이면 0.5, 점수면 0 기준
+            default_thr = 0.0 if (y_prob.min() < 0 or y_prob.max() > 1) else 0.5
+            y_pred = (y_prob >= default_thr).astype(int)
 
     acc = accuracy_score(y_true, y_pred)
     prec, rec, f1, _ = precision_recall_fscore_support(
@@ -228,7 +227,7 @@ metrics_report("MLP(Keras)", y_test, y_prob=y_prob_mlp)
 
 bt = best_threshold_by_f1(y_test, y_prob_mlp)
 print(f"Best threshold by F1 (MLP): {bt}")
-
+metrics_report("MLP(Keras)-bestF1", y_test, y_prob=y_prob_mlp, thr=bt["threshold"])
 # ROC / PR 곡선 (옵션)
 fpr, tpr, _ = roc_curve(y_test, y_prob_mlp)
 plt.plot(fpr, tpr); plt.plot([0,1],[0,1],'--'); plt.xlabel("FPR"); plt.ylabel("TPR")
@@ -245,8 +244,41 @@ print("\n== Logistic Regression (balanced) ==")
 logreg = LogisticRegression(solver='liblinear', class_weight='balanced', random_state=SEED)
 logreg.fit(X_train, y_train)
 prob_lr = logreg.predict_proba(X_test)[:,1]
-metrics_report("LogReg(balanced)", y_test, y_prob=prob_lr)
+metrics_report("LogReg(balanced)", y_test, y_prob=prob_lr, thr=prob_lr["threshold"])
 print("Best threshold by F1 (LogReg):", best_threshold_by_f1(y_test, prob_lr))
+
+# --- (A) LogReg coefficients: CSV + Figure (Feature Importance)
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+os.makedirs("figures", exist_ok=True)
+FEATURE_NAMES = FEATURES[:]
+coefs = np.ravel(logreg.coef_)                 # shape (n_features,)
+df_coef = pd.DataFrame({"feature": FEATURE_NAMES, "coef": coefs})
+df_coef.to_csv("logreg_coefficients.csv", index=False)
+print("✅ Saved: logreg_coefficients.csv")
+
+# 절대값 기준 내림차순 정렬 후 가로막대
+order = np.argsort(-np.abs(coefs))
+
+feat_sorted = [FEATURE_NAMES[i] for i in order]
+coef_sorted = coefs[order]
+abs_sorted  = np.abs(coef_sorted)
+
+plt.figure(figsize=(6, 3.8))
+y = np.arange(len(abs_sorted))
+plt.barh(y, abs_sorted)
+plt.yticks(y, feat_sorted)
+plt.xlabel("Absolute Coefficient Magnitude")
+plt.title("Balanced Logistic Regression — Coefficient Magnitudes")
+for i, v in enumerate(abs_sorted):
+    plt.text(v, i, f" {v:.3f}", va="center", ha="left", fontsize=8)
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.savefig("figures/logreg_coefficients.pdf", dpi=300)
+plt.close()
+print("✅ Saved: figures/logreg_coefficients.pdf")
 
 print("\n== Logistic Regression L1(saga, balanced) ==")
 logreg_l1 = LogisticRegression(
@@ -437,7 +469,6 @@ def report_seq(name, y_true, y_prob):
     ConfusionMatrixDisplay(cm, display_labels=["Benign","Attack"]).plot(cmap=plt.cm.Oranges)
     plt.title(f"{name} - Confusion Matrix"); plt.grid(False); plt.show()
 
-report_seq("LSTM(seq)", yte, y_prob_lstm)
 
 # G) F1 최적 임계값
 bt_lstm = best_threshold_by_f1(yte, y_prob_lstm)
