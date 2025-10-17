@@ -9,6 +9,14 @@
     "DATA_6",
     "DATA_7"
   ],
-  "threshold_default": 0.5,
-  "notes": "Scaled with StandardScaler from training set; MLP quantized INT8 for NPU."
+  "thresholds": {
+    "logreg_val_f1_best": 0.5313538143279558,
+    "mlp_val_f1_best": 0.700355052947998
+  },
+  "splits": {
+    "train": 124654,
+    "val": 48110,
+    "test": 61112
+  },
+  "notes": "Thresholds found on validation; use same for test/board."
 }
