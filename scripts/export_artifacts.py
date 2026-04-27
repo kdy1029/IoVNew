@@ -1,12 +1,11 @@
 #!/usr/bin/env python
-"""Compatibility wrapper for board artifact export.
+import sys
+from pathlib import Path
 
-Use scripts/export_tflite.py for the INT8 TensorFlow Lite MLP export.
-"""
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.export_tflite import train_artifact_models
 
 
 if __name__ == "__main__":
     train_artifact_models()
-
