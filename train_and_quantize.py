@@ -17,7 +17,7 @@ SEED=42
 random.seed(SEED); np.random.seed(SEED)
 
 # -----------------------------
-# 데이터 로드/정리
+# Data Load / Cleanup
 # -----------------------------
 atk_files = [
     './data/decimal/decimal_DoS.csv',
@@ -34,11 +34,11 @@ def read_and_clean(path_or_df):
     df = df.drop(columns=['category','specific_class'], errors='ignore')
     need = FEATURES + ['label']
     missing = [c for c in need if c not in df.columns]
-    if missing: raise ValueError(f"필수 컬럼 누락: {missing}")
+    if missing: raise ValueError(f"Missing required columns: {missing}")
     for c in FEATURES: df[c] = pd.to_numeric(df[c], errors='coerce').astype('float32')
     df['label'] = df['label'].astype(str).str.lower().map({'benign':0,'0':0,'attack':1,'1':1})
     if 'ID' not in df.columns:
-        # 동일 행 중복 누수 방지용 group id (고정길이)
+        # Fixed length group id to prevent leakage of identical rows
         df['ID'] = 'gid_' + (np.arange(len(df)) // 50).astype(str)
     return df
 
@@ -52,7 +52,7 @@ df = df.sample(frac=1.0, random_state=SEED).reset_index(drop=True)
 X = df[FEATURES].values.astype('float32')
 y = df['label'].values.astype('int32')
 
-# 그룹 해시로 누수 차단
+# Prevent leakage using group hash
 def row_hash(vec: np.ndarray) -> str:
     return hashlib.sha1(np.ascontiguousarray(vec).tobytes()).hexdigest()
 groups = np.array([row_hash(r) for r in X])
@@ -65,32 +65,36 @@ y_train, y_test = y[train_idx], y[test_idx]
 print(f"All data shape: X={X.shape}, y={y.shape}, positives={(y==1).sum()} ({100*(y==1).mean():.3f}%)")
 print(f"Train/Test sizes: {X_train_raw.shape}/{X_test_raw.shape}")
 
-# 스케일
+# Scale
 scaler = StandardScaler()
 X_train = scaler.fit_transform(X_train_raw)
 X_test  = scaler.transform(X_test_raw)
 
 # -----------------------------
-# 유틸: 평가 + 최적 임계값
+# Utility: Evaluation + Optimal Threshold
 # -----------------------------
 def eval_with_thresholds(y_true, scores, thr=0.5, label="Model"):
-    # 기본 임계값
+    # Default threshold
     pred = (scores >= thr).astype(int)
     acc = accuracy_score(y_true, pred)
     prec, rec, f1, _ = precision_recall_fscore_support(y_true, pred, average='binary', zero_division=0)
     auc = roc_auc_score(y_true, scores)
-    # F1 최대 임계값
+    
+    # Maximum F1 threshold
     p_curve, r_curve, t_curve = precision_recall_curve(y_true, scores)
     f1_curve = (2*p_curve*r_curve) / (p_curve + r_curve + 1e-12)
     best_idx = int(np.nanargmax(f1_curve))
     bestF1 = float(f1_curve[best_idx])
-    # precision_recall_curve는 마지막 점 임계값이 없음 → 보정
+    
+    # precision_recall_curve lacks the last point threshold → correct it
     if best_idx >= len(t_curve): best_idx = len(t_curve)-1
     best_thr = float(t_curve[max(0,best_idx)])
-    # 재계산
+    
+    # Recalculate
     pred_best = (scores >= best_thr).astype(int)
     acc_b = accuracy_score(y_true, pred_best)
     prec_b, rec_b, f1_b, _ = precision_recall_fscore_support(y_true, pred_best, average='binary', zero_division=0)
+    
     return {
         "label": label,
         "thr_default": float(thr),
@@ -111,7 +115,7 @@ res_lr = eval_with_thresholds(y_test, scores_lr, thr=0.5, label="LogReg(balanced
 print(f"[LogReg]  Acc={res_lr['acc']:.4f} Prec={res_lr['prec']:.4f} Rec={res_lr['rec']:.4f} F1={res_lr['f1']:.4f} AUC={res_lr['auc']:.4f}")
 print(f"[LogReg-bestF1] Thr={res_lr['thr_bestF1']:.6f} F1={res_lr['f1_b']:.4f}")
 
-# 보드용 파라미터(w,b) 저장
+# Save parameters (w,b) for the board
 # coef_: (1, n_features), intercept_: (1,)
 w = logreg.coef_.ravel().astype('float32')
 b = np.float32(logreg.intercept_.ravel()[0])
@@ -127,7 +131,7 @@ res_gnb = eval_with_thresholds(y_test, scores_gnb, thr=0.5, label="GaussianNB")
 print(f"[GNB]     Acc={res_gnb['acc']:.4f} Prec={res_gnb['prec']:.4f} Rec={res_gnb['rec']:.4f} F1={res_gnb['f1']:.4f} AUC={res_gnb['auc']:.4f}")
 print(f"[GNB-bestF1] Thr={res_gnb['thr_bestF1']:.6f} F1={res_gnb['f1_b']:.4f}")
 
-# 보드용 파라미터(클래스별 평균/분산/사전확률) 저장
+# Save parameters (mean/variance/prior per class) for the board
 # class_count_, class_prior_, theta_(C,F), var_(C,F)
 np.savez("artifacts/gnb_params.npz",
          mu=gnb.theta_.astype('float32'),
@@ -135,7 +139,7 @@ np.savez("artifacts/gnb_params.npz",
          prior=gnb.class_prior_.astype('float32'))
 
 # -----------------------------
-# 3) ExtraTrees (얕고 적게 추천 설정)
+# 3) ExtraTrees (Recommended setting: shallow and few estimators)
 # -----------------------------
 et = ExtraTreesClassifier(
     n_estimators=100,
@@ -153,20 +157,20 @@ print(f"[ExtraTrees]  Acc={res_et['acc']:.4f} Prec={res_et['prec']:.4f} Rec={res
 print(f"[ExtraTrees-bestF1] Thr={res_et['thr_bestF1']:.6f} F1={res_et['f1_b']:.4f}")
 
 # -----------------------------
-# 아티팩트 저장
+# Save Artifacts
 # -----------------------------
-# 0) 스케일러
+# 0) Scaler
 np.savez("artifacts/scaler.npz",
          mean_=scaler.mean_.astype('float32'),
          scale_=scaler.scale_.astype('float32'))
 
-# 1) 모델 객체 (데스크탑/보드 Python 추론용)
+# 1) Model Objects (for Desktop/Board Python inference)
 import joblib
 joblib.dump(logreg,      "artifacts/logreg.joblib")
 joblib.dump(gnb,         "artifacts/gnb.joblib")
 joblib.dump(et,          "artifacts/extratrees.joblib")
 
-# 2) 임계값/메타 정보
+# 2) Thresholds/Metadata
 thresholds = {
     "features": FEATURES,
     "logreg":   {"thr_default": 0.5, "thr_bestF1": res_lr["thr_bestF1"]},
@@ -177,7 +181,7 @@ thresholds = {
 with open("artifacts/thresholds.json","w") as f:
     json.dump(thresholds, f, indent=2)
 
-# 3) 성능 요약 CSV
+# 3) Performance Summary CSV
 rows = []
 for r in (res_lr, res_gnb, res_et):
     rows.append({

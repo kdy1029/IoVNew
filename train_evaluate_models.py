@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-CAN-IDS: Decimal 데이터셋 (DATA_0..7) 이진 분류
-- 누수 차단: 그룹 기반 분할(동일 행 중복이 train/test에 동시에 안 들어가게)
-- 스케일링: Train에만 fit, Test엔 transform
-- 불균형 보정: class_weight='balanced' (+ Keras class_weight)
-- 모델: MLP(Keras), LogisticRegression, Logistic-L1(saga), LinearSVC, SGD, Ridge, Perceptron, PassiveAggressive,
-        DecisionTree(shallow), ExtraTrees(shallow), GaussianNB, ComplementNB(binned), BernoulliNB(binarized)
-- 지표: Acc, Prec, Rec, F1, ROC-AUC + 혼동행렬 / 임계값 튜닝(F1 최대)
+CAN-IDS: Binary classification of Decimal dataset (DATA_0..7)
+- Leakage Prevention: Group-based split (prevents identical rows from appearing in both train and test)
+- Scaling: Fit on Train only, transform on Test
+- Imbalance Correction: class_weight='balanced' (+ Keras class_weight)
+- Models: MLP(Keras), LogisticRegression, Logistic-L1(saga), LinearSVC, SGD, Ridge, Perceptron, PassiveAggressive,
+          DecisionTree(shallow), ExtraTrees(shallow), GaussianNB, ComplementNB(binned), BernoulliNB(binarized)
+- Metrics: Acc, Prec, Rec, F1, ROC-AUC + Confusion Matrix / Threshold tuning (max F1)
 """
 
 import os, random, hashlib
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # CPU 고정 (GPU 비교시 주석 처리)
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Fix to CPU (comment out for GPU comparison)
 
 import numpy as np
 import pandas as pd
@@ -45,13 +45,13 @@ from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping
 
 # -----------------------------
-# 0) 시드 고정
+# 0) Fix Random Seed
 # -----------------------------
 SEED = 42
 random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 
 # -----------------------------
-# 1) 데이터 로드/클린업
+# 1) Data Load / Cleanup
 # -----------------------------
 atk_files = [
     './data/decimal/decimal_DoS.csv',
@@ -64,35 +64,35 @@ benign_file = './data/decimal/decimal_benign.csv'
 
 def read_and_clean(path_or_df):
     df = pd.read_csv(path_or_df) if isinstance(path_or_df, str) else path_or_df.copy()
-    # ID는 보존, 기타 불필요 컬럼만 제거
+    # Preserve ID, drop other unnecessary columns
     df = df.drop(columns=['category','specific_class'], errors='ignore')
 
-    # 필수 컬럼 확인 (ID는 선택)
+    # Check required columns (ID is optional)
     use_cols = [f'DATA_{i}' for i in range(8)] + ['label']
     missing = [c for c in use_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"필수 컬럼 누락: {missing}")
+        raise ValueError(f"Missing required columns: {missing}")
 
-    # 타입 캐스팅
+    # Type casting
     for c in [f'DATA_{i}' for i in range(8)]:
         df[c] = pd.to_numeric(df[c], errors='coerce').astype('float32')
 
-    # 라벨 정규화 (공격:1, 정상:0)
+    # Normalize labels (Attack:1, Benign:0)
     df['label'] = df['label'].astype(str).str.lower().map({'benign':0, '0':0, 'attack':1, '1':1})
 
-    # ID가 없으면 임시 ID 생성(시퀀스 묶음용)
+    # Generate temporary ID if none exists (for sequence grouping)
     if 'ID' not in df.columns:
-        df['ID'] = 'gid_' + (np.arange(len(df)) // 50).astype(str)  # 50개 단위로 같은 그룹
+        df['ID'] = 'gid_' + (np.arange(len(df)) // 50).astype(str)  # Group every 50 records
     return df
 
-# 공격/정상 CSV 로드 및 강제 라벨
+# Load Attack/Benign CSV and enforce labels
 atk_df = pd.concat([pd.read_csv(f) for f in atk_files], ignore_index=True)
 atk_df = atk_df.assign(label=1)
 atk_df = read_and_clean(atk_df)
 
 benign_df = read_and_clean(pd.read_csv(benign_file).assign(label=0))
 
-# 통합 → NaN 제거 → 셔플
+# Merge → Remove NaN → Shuffle
 df = pd.concat([atk_df, benign_df], ignore_index=True).dropna()
 df = df.sample(frac=1.0, random_state=SEED).reset_index(drop=True)
 
@@ -103,7 +103,7 @@ y = df['label'].values.astype('int32')
 print(f"All data shape: X={X.shape}, y={y.shape}, positives={y.sum()} ({y.mean():.3%})")
 
 # -----------------------------
-# 2) 그룹 기반 분할(동일 행 중복 그룹화)
+# 2) Group-based Split (Group identical rows)
 # -----------------------------
 def row_hash(vec: np.ndarray) -> str:
     return hashlib.sha1(np.ascontiguousarray(vec).tobytes()).hexdigest()
@@ -114,36 +114,36 @@ groups = np.array([row_hash(r) for r in X])
 gss = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=SEED)
 train_idx, test_idx = next(gss.split(X, y, groups=groups))
 
-# NB 이산화용 원본 보관
+# Keep raw features for NB discretization
 X_train_raw, X_test_raw = X[train_idx].copy(), X[test_idx].copy()
 
 X_train, X_test = X[train_idx], X[test_idx]
 y_train, y_test = y[train_idx], y[test_idx]
 grp_train, grp_test = groups[train_idx], groups[test_idx]
 
-# 교차 누수 확인 (0이어야 정상)
+# Check for cross-leakage (should be 0)
 inter = set(grp_train).intersection(set(grp_test))
 print(f"Group overlap between train/test: {len(inter)} (should be 0)")
 
-# 클래스 분포 확인
+# Check class distribution
 print("Train dist:", Counter(y_train))
 print("Test  dist:", Counter(y_test))
 
 # -----------------------------
-# 3) 스케일링 (누수 방지: train fit → test transform)
+# 3) Scaling (Prevent leakage: fit on train → transform on test)
 # -----------------------------
 scaler = StandardScaler()
 X_train = scaler.fit_transform(X_train)
 X_test  = scaler.transform(X_test)
 
 # -----------------------------
-# 4) 평가지표/리포팅 + 임계값 튜닝 유틸
+# 4) Evaluation Metrics/Reporting + Threshold Tuning Utility
 # -----------------------------
 def metrics_report(name, y_true, y_prob=None, y_pred=None, plot_cm=True, thr=None):
     if y_pred is None:
         if y_prob is None:
-            raise ValueError("y_prob 또는 y_pred 중 하나는 필요합니다.")
-        # decision_function 점수(음수/양수) 또는 확률([0,1]) 모두 처리
+            raise ValueError("Either y_prob or y_pred is required.")
+        # Handle both decision_function scores (negative/positive) or probabilities ([0,1])
         default_thr = 0.0 if (y_prob.min() < 0 or y_prob.max() > 1) else 0.5
         use_thr = default_thr if thr is None else thr
         y_pred = (y_prob >= use_thr).astype(int)
@@ -169,19 +169,19 @@ def metrics_report(name, y_true, y_prob=None, y_pred=None, plot_cm=True, thr=Non
     return dict(acc=acc, prec=prec, rec=rec, f1=f1, auc=aucv)
 
 def best_threshold_by_f1(y_true, y_prob):
-    """precision_recall_curve를 이용해 F1 최대 지점을 찾음(점수/확률 모두 허용)."""
+    """Find the point of maximum F1 using precision_recall_curve (allows both scores/probs)."""
     p, r, thr = precision_recall_curve(y_true, y_prob)
     f1s = 2*p*r / (p+r+1e-9)
-    idx = np.argmax(f1s[:-1])  # thr 길이는 p/r보다 1 작음
+    idx = np.argmax(f1s[:-1])  # length of thr is 1 less than p/r
     return dict(threshold=float(thr[idx]), precision=float(p[idx]), recall=float(r[idx]), f1=float(f1s[idx]))
 
 def get_scores(clf, X):
-    """모델에서 이진 판별용 점수 벡터를 일관되게 얻기."""
+    """Consistently obtain score vectors for binary classification from the model."""
     if hasattr(clf, "predict_proba"):
-        return clf.predict_proba(X)[:, 1]           # 확률
+        return clf.predict_proba(X)[:, 1]           # Probability
     if hasattr(clf, "decision_function"):
-        return clf.decision_function(X)             # 마진/점수
-    return clf.predict(X).astype(float)             # 예외(비권장)
+        return clf.decision_function(X)             # Margin/Score
+    return clf.predict(X).astype(float)             # Exception (Not recommended)
 
 def tune_and_report(name, y_true, scores):
     bt = best_threshold_by_f1(y_true, scores)
@@ -189,7 +189,7 @@ def tune_and_report(name, y_true, scores):
     metrics_report(f"{name}-bestF1", y_true, y_prob=scores, thr=bt["threshold"])
 
 # -----------------------------
-# 5) 더미 기준선
+# 5) Dummy Baseline
 # -----------------------------
 dum = DummyClassifier(strategy="most_frequent", random_state=SEED).fit(X_train, y_train)
 y_prob_dum = dum.predict_proba(X_test)[:,1] if hasattr(dum, "predict_proba") else None
@@ -198,7 +198,7 @@ print("\n== Dummy (most_frequent) ==")
 metrics_report("Dummy", y_test, y_prob=y_prob_dum, y_pred=y_pred_dum)
 
 # -----------------------------
-# 6) Keras MLP (LSTM 아님!)
+# 6) Keras MLP (Not LSTM!)
 # -----------------------------
 classes = np.unique(y_train)
 cw = compute_class_weight('balanced', classes=classes, y=y_train)
@@ -224,9 +224,9 @@ _ = mlp.fit(
 
 y_prob_mlp = mlp.predict(X_test, verbose=0).ravel()
 print("\n== MLP (Keras, balanced) ==")
-metrics_report("MLP(Keras)", y_test, y_prob=y_prob_mlp)   # 기본 0.5
-tune_and_report("MLP(Keras)", y_test, y_prob_mlp)         # ★ F1 최적 임계값
-# (선택) ROC/PR
+metrics_report("MLP(Keras)", y_test, y_prob=y_prob_mlp)   # Default 0.5
+tune_and_report("MLP(Keras)", y_test, y_prob_mlp)         # ★ Optimal F1 threshold
+# (Optional) ROC/PR
 fpr, tpr, _ = roc_curve(y_test, y_prob_mlp)
 plt.plot(fpr, tpr); plt.plot([0,1],[0,1],'--'); plt.xlabel("FPR"); plt.ylabel("TPR")
 plt.title("MLP ROC Curve"); plt.grid(True); plt.show()
@@ -235,14 +235,14 @@ plt.plot(recv, precv); plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title(
 plt.grid(True); plt.show()
 
 # -----------------------------
-# 7) 전통 ML 모델들 (클래스 가중 + 스케일 동일)
+# 7) Traditional ML Models (Class Weight + Same Scaling)
 # -----------------------------
 print("\n== Logistic Regression (balanced) ==")
 logreg = LogisticRegression(solver='liblinear', class_weight='balanced', random_state=SEED)
 logreg.fit(X_train, y_train)
 scores_lr = get_scores(logreg, X_test)
-metrics_report("LogReg(balanced)", y_test, y_prob=scores_lr)   # 기본 0.5 또는 0.0
-tune_and_report("LogReg(balanced)", y_test, scores_lr)         # ★ F1 최적 임계값
+metrics_report("LogReg(balanced)", y_test, y_prob=scores_lr)   # Default 0.5 or 0.0
+tune_and_report("LogReg(balanced)", y_test, scores_lr)         # ★ Optimal F1 threshold
 
 # --- (A) LogReg coefficients: CSV + Figure (Feature Importance)
 os.makedirs("figures", exist_ok=True)
@@ -252,7 +252,7 @@ df_coef = pd.DataFrame({"feature": FEATURE_NAMES, "coef": coefs})
 df_coef.to_csv("logreg_coefficients.csv", index=False)
 print("✅ Saved: logreg_coefficients.csv")
 
-# 절대값 기준 내림차순 정렬 후 가로막대
+# Descending order by absolute value, then horizontal bar chart
 order = np.argsort(-np.abs(coefs))
 feat_sorted = [FEATURE_NAMES[i] for i in order]
 coef_sorted = coefs[order]
@@ -342,7 +342,7 @@ metrics_report("GaussianNB", y_test, y_prob=scores_gnb)
 tune_and_report("GaussianNB", y_test, scores_gnb)
 
 # -----------------------------
-# 8) Naive Bayes 변종 (ComplementNB, BernoulliNB) — binning 사용
+# 8) Naive Bayes Variants (ComplementNB, BernoulliNB) — Using binning
 # -----------------------------
 print("\n== NB variants with KBinsDiscretizer (on raw decimal) ==")
 binner = KBinsDiscretizer(n_bins=16, encode='ordinal', strategy='uniform')
@@ -357,7 +357,7 @@ metrics_report("ComplementNB(binned)", y_test, y_prob=scores_cnb)
 tune_and_report("ComplementNB(binned)", y_test, scores_cnb)
 
 print("\n-- BernoulliNB --")
-binner2 = KBinsDiscretizer(n_bins=2, encode='ordinal', strategy='uniform')  # 2-bin 이진화
+binner2 = KBinsDiscretizer(n_bins=2, encode='ordinal', strategy='uniform')  # 2-bin binarization
 X_train_bin2 = binner2.fit_transform(X_train_raw)
 X_test_bin2  = binner2.transform(X_test_raw)
 
@@ -368,11 +368,11 @@ metrics_report("BernoulliNB(binarized)", y_test, y_prob=scores_bnb)
 tune_and_report("BernoulliNB(binarized)", y_test, scores_bnb)
 
 # ============================
-# 10) LSTM (시퀀스 기반)
+# 10) LSTM (Sequence-based)
 # ============================
 print("\n== LSTM (sequence) ==")
 
-# A) 시퀀스 빌더: 같은 ID 안에서 연속 timesteps로 윈도 생성
+# A) Sequence Builder: Create windows with continuous timesteps within the same ID
 def build_sequences_df_basic(df, features, label_col, group_col='ID',
                              timesteps=10, step=1, timestamp_cols=('timestamp','time','ts')):
     ts_col = next((c for c in timestamp_cols if c in df.columns), None)
@@ -400,7 +400,7 @@ X_seq, y_seq, groups_seq = build_sequences_df_basic(df, SEQ_FEATURES, 'label', g
 
 print(f"Seq shapes: X_seq={X_seq.shape}, y_seq={y_seq.shape}, #groups={len(np.unique(groups_seq))}")
 
-# B) 그룹 기반 분할
+# B) Group-based Split
 gss_seq = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=SEED)
 tr_idx, te_idx = next(gss_seq.split(X_seq, y_seq, groups=groups_seq))
 Xtr, Xte = X_seq[tr_idx], X_seq[te_idx]
@@ -409,7 +409,7 @@ grp_tr, grp_te = groups_seq[tr_idx], groups_seq[te_idx]
 assert len(set(grp_tr).intersection(set(grp_te))) == 0, "LSTM group leakage!"
 print(f"LSTM split: train={Xtr.shape}, test={Xte.shape}")
 
-# C) 시퀀스 스케일링
+# C) Sequence Scaling
 scaler_seq = StandardScaler()
 Xtr_flat = Xtr.reshape(-1, Xtr.shape[2])
 Xte_flat = Xte.reshape(-1, Xte.shape[2])
@@ -418,12 +418,12 @@ Xte_flat = scaler_seq.transform(Xte_flat)
 Xtr = Xtr_flat.reshape(Xtr.shape)
 Xte = Xte_flat.reshape(Xte.shape)
 
-# D) 클래스 가중치
+# D) Class Weights
 classes = np.unique(ytr)
 cw = compute_class_weight('balanced', classes=classes, y=ytr)
 class_weight_seq = {int(c): w for c, w in zip(classes, cw)}
 
-# E) LSTM 모델(가볍게)
+# E) LSTM Model (Lightweight)
 from tensorflow.keras.layers import LSTM, Bidirectional
 
 tf.keras.utils.set_random_seed(SEED)
@@ -438,7 +438,7 @@ es2 = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 _ = lstm.fit(Xtr, ytr, epochs=30, batch_size=256, validation_split=0.2,
              class_weight=class_weight_seq, callbacks=[es2], verbose=0)
 
-# F) 평가 + 임계값 튜닝
+# F) Evaluation + Threshold Tuning
 y_prob_lstm = lstm.predict(Xte, verbose=0).ravel()
 
 def report_seq(name, y_true, y_prob, thr=0.5):
@@ -457,7 +457,7 @@ bt_lstm = best_threshold_by_f1(yte, y_prob_lstm)
 print("Best threshold by F1 (LSTM):", bt_lstm)
 report_seq("LSTM(seq)-bestF1", yte, y_prob_lstm, thr=bt_lstm['threshold'])
 
-# (선택) ROC / PR
+# (Optional) ROC / PR
 fpr, tpr, _ = roc_curve(yte, y_prob_lstm)
 plt.plot(fpr, tpr); plt.plot([0,1],[0,1],'--'); plt.xlabel("FPR"); plt.ylabel("TPR")
 plt.title("LSTM ROC Curve"); plt.grid(True); plt.show()
@@ -470,17 +470,17 @@ plt.grid(True); plt.show()
 # ============================
 print("\n== LSTM (sequence, improved) ==")
 
-# ── A) 시퀀스/라벨 설정값
-TIMESTEPS   = 20     # 윈도 길이 (10~50 사이 튜닝)
-STEP        = 1      # 슬라이딩 간격
+# ── A) Sequence/Label settings
+TIMESTEPS   = 20     # Window length (tune between 10~50)
+STEP        = 1      # Sliding interval
 LABEL_RULE  = "ratio"  # 'last' | 'any' | 'ratio'
-POS_RATIO   = 0.3    # LABEL_RULE='ratio'일 때 양성 비율 임계값
-ADD_CONTEXT = True   # diff/rolling 등 경량 시계열 피처 추가 여부
+POS_RATIO   = 0.3    # Positive ratio threshold when LABEL_RULE='ratio'
+ADD_CONTEXT = True   # Whether to add lightweight time-series features like diff/rolling
 
-# ── B) 시퀀스용 데이터프레임: 전역 셔플 없는 "원본 순서" 유지
+# ── B) Sequence DataFrame: Preserve "original order" without global shuffle
 df_seq = pd.concat([atk_df, benign_df], ignore_index=True)
 
-# (선택) 간단한 시간 맥락 피처 추가
+# (Optional) Add simple time context features
 if ADD_CONTEXT:
     ts_col = next((c for c in ['timestamp','time','ts'] if c in df_seq.columns), None)
     sort_cols = ['ID'] + ([ts_col] if ts_col is not None else [])
@@ -501,12 +501,12 @@ if ADD_CONTEXT:
 else:
     SEQ_FEATURES_IMP = [f'DATA_{i}' for i in range(8)]
 
-# ── C) ID 인덱스 생성
+# ── C) Create ID Index
 id2idx = {idv:i for i, idv in enumerate(df_seq['ID'].astype(str).unique())}
 df_seq['id_idx'] = df_seq['ID'].astype(str).map(id2idx).astype('int32')
 NUM_IDS = len(id2idx)
 
-# ── D) 시퀀스 빌더
+# ── D) Sequence Builder
 def build_sequences_df(df_in, features, label_col, id_idx_col='id_idx',
                        timesteps=10, step=1):
     ts_col = next((c for c in ['timestamp','time','ts'] if c in df_in.columns), None)
@@ -535,7 +535,7 @@ def build_sequences_df(df_in, features, label_col, id_idx_col='id_idx',
             X_seq.append(Xw)
             y_seq.append(ylab)
             groups.append(gid)
-            id_seq.append(ig[0])   # 윈도 내 ID는 동일
+            id_seq.append(ig[0])   # ID is same within the window
 
     return np.array(X_seq), np.array(y_seq), np.array(groups), np.array(id_seq)
 
@@ -545,7 +545,7 @@ X_seq_imp, y_seq_imp, grp_seq_imp, id_seq_imp = build_sequences_df(
 
 print(f"Seq shapes: X_seq={X_seq_imp.shape}, y_seq={y_seq_imp.shape}, #unique_IDs={NUM_IDS}")
 
-# ── E) 그룹 분할
+# ── E) Group Split
 gss_seq_imp = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=SEED)
 tr_idx, te_idx = next(gss_seq_imp.split(X_seq_imp, y_seq_imp, groups=grp_seq_imp))
 
@@ -556,7 +556,7 @@ grp_tr_imp, grp_te_imp = grp_seq_imp[tr_idx], grp_seq_imp[te_idx]
 assert len(set(grp_tr_imp).intersection(set(grp_te_imp))) == 0, "LSTM group leakage!"
 print(f"LSTM split: train={Xtr_imp.shape}, test={Xte_imp.shape}, ids(train/test)={len(np.unique(idtr))}/{len(np.unique(idte))}")
 
-# ── F) 스케일링
+# ── F) Scaling
 scaler_seq_imp = StandardScaler(with_mean=True, with_std=True)
 Xtr_flat = Xtr_imp.reshape(-1, Xtr_imp.shape[2])
 Xte_flat = Xte_imp.reshape(-1, Xte_imp.shape[2])
@@ -565,12 +565,12 @@ Xte_flat = scaler_seq_imp.transform(Xte_flat)
 Xtr_imp = Xtr_flat.reshape(Xtr_imp.shape)
 Xte_imp = Xte_flat.reshape(Xte_imp.shape)
 
-# ── G) 클래스 가중치
+# ── G) Class Weights
 classes = np.unique(ytr_imp)
 cw = compute_class_weight('balanced', classes=classes, y=ytr_imp)
 class_weight_seq_imp = {int(c): w for c, w in zip(classes, cw)}
 
-# ── H) 모델(시퀀스 + ID 임베딩 결합)
+# ── H) Model (Combine Sequence + ID Embedding)
 from tensorflow.keras import Model
 from tensorflow.keras.layers import LSTM, Bidirectional, Dropout, Dense, Input, Embedding, Flatten, Concatenate
 
@@ -597,7 +597,7 @@ es2 = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 _ = lstm_model.fit([Xtr_imp, idtr], ytr_imp, epochs=30, batch_size=256, validation_split=0.2,
                    class_weight=class_weight_seq_imp, callbacks=[es2], verbose=0)
 
-# ── I) 평가 + 임계값 튜닝
+# ── I) Evaluation + Threshold Tuning
 y_prob_lstm_imp = lstm_model.predict([Xte_imp, idte], verbose=0).ravel()
 
 def report_seq_imp(name, y_true, y_prob, thr=0.5):
@@ -616,7 +616,7 @@ bt_lstm_imp = best_threshold_by_f1(yte_imp, y_prob_lstm_imp)
 print("Best threshold by F1 (LSTM seq+ID):", bt_lstm_imp)
 report_seq_imp("LSTM(seq+ID)-bestF1", yte_imp, y_prob_lstm_imp, thr=bt_lstm_imp['threshold'])
 
-# (선택) ROC / PR
+# (Optional) ROC / PR
 fpr, tpr, _ = roc_curve(yte_imp, y_prob_lstm_imp)
 plt.plot(fpr, tpr); plt.plot([0,1],[0,1],'--'); plt.xlabel("FPR"); plt.ylabel("TPR")
 plt.title("LSTM(seq+ID) ROC Curve"); plt.grid(True); plt.show()
@@ -625,7 +625,7 @@ plt.plot(recv, precv); plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title(
 plt.grid(True); plt.show()
 
 # -----------------------------
-# 9) 누수 재확인 (정확 행 중복 수)
+# 9) Recheck Leakage (Exact duplicate row count)
 # -----------------------------
 def count_exact_dups(X_tr, X_te):
     def hrow(r): return hashlib.sha1(np.ascontiguousarray(r).tobytes()).hexdigest()

@@ -6,36 +6,36 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
-# 파일 경로
+# File paths
 TREE_CSV = "pred_extratrees.csv"
 MLP_CSV  = "pred_mlp_npu.csv"
 
-# 1) CSV 로드
+# 1) Load CSV
 tree = pd.read_csv(TREE_CSV)
 mlp  = pd.read_csv(MLP_CSV)
 
-# 2) 정답/점수 컬럼 자동 탐색
+# 2) Automatic column detection for labels and scores
 def pick_cols(df):
     cols = {c.lower(): c for c in df.columns}
-    # y_true 후보
+    # Candidates for y_true
     ytrue_candidates = ['label', 'category', 'target', 'y_true', 'gt', 'truth']
     y_true_col = next((cols[c] for c in ytrue_candidates if c in cols), None)
-    # score 후보
+    # Candidates for score
     score_candidates = ['prob', 'score', 'y_score', 'proba', 'confidence']
     y_score_col = next((cols[c] for c in score_candidates if c in cols), None)
     if y_true_col is None or y_score_col is None:
-        raise ValueError(f"정답/점수 컬럼을 찾을 수 없습니다. columns={list(df.columns)}")
+        raise ValueError(f"Cannot find true/score columns. columns={list(df.columns)}")
     return y_true_col, y_score_col
 
 yt_tree, ys_tree = pick_cols(tree)
 yt_mlp,  ys_mlp  = pick_cols(mlp)
 
-# 3) 정답 벡터 (두 파일이 동일해야 함) — 한쪽에서만 사용
+# 3) True label vector (must be identical for both files) — use from one side only
 y_true_raw = tree[yt_tree].values
 
-# 문자열 라벨이면 0/1로 매핑
+# Map string labels to 0/1
 if y_true_raw.dtype.kind in {'U','S','O'}:
-    # 흔한 라벨 매핑
+    # Common label mappings
     mapping = {
         'ATTACK': 1, 'BENIGN': 0,
         'MALICIOUS': 1, 'NORMAL': 0,
@@ -44,27 +44,27 @@ if y_true_raw.dtype.kind in {'U','S','O'}:
     y_true = pd.Series(y_true_raw).map(mapping)
     if y_true.isna().any():
         uniq = pd.unique(y_true_raw)
-        raise ValueError(f"라벨 매핑 실패. 라벨 값들={uniq} 에 맞게 mapping을 보강하세요.")
+        raise ValueError(f"Label mapping failed. Please update mapping for labels={uniq}.")
     y_true = y_true.values.astype(int)
 else:
-    # 숫자라면 0/1로 캐스팅
+    # Cast to int if already numeric
     y_true = pd.Series(y_true_raw).astype(int).values
 
-# 4) 점수 벡터
+# 4) Score vector
 y_score_tree = pd.to_numeric(tree[ys_tree], errors='coerce').fillna(0).values
 y_score_mlp  = pd.to_numeric(mlp[ys_mlp],  errors='coerce').fillna(0).values
 
-# 길이 확인 (다르면 인덱스로 교집합 정렬 등 추가 필요)
+# Verify lengths
 assert len(y_true) == len(y_score_tree) == len(y_score_mlp), \
-    f"길이가 다릅니다: y_true={len(y_true)}, tree={len(y_score_tree)}, mlp={len(y_score_mlp)}"
+    f"Lengths differ: y_true={len(y_true)}, tree={len(y_score_tree)}, mlp={len(y_score_mlp)}"
 
-# 5) ROC 계산
-fpr_tree, tpr_tree, _ = roc_curve(y_true, y_score_tree)   # y_true가 0/1이면 pos_label 지정 불필요
+# 5) Calculate ROC
+fpr_tree, tpr_tree, _ = roc_curve(y_true, y_score_tree)
 fpr_mlp,  tpr_mlp,  _ = roc_curve(y_true, y_score_mlp)
 roc_auc_tree = auc(fpr_tree, tpr_tree)
 roc_auc_mlp  = auc(fpr_mlp,  tpr_mlp)
 
-# 6) 플롯
+# 6) Plot
 plt.figure(figsize=(6, 4))
 plt.plot(fpr_tree, tpr_tree, lw=2.2, color='#1b9e77',
          label=f'Extra Trees (AUC = {roc_auc_tree:.3f})')

@@ -11,12 +11,12 @@ os.makedirs("figures", exist_ok=True)
 # -----------------------------
 # 1) ROC & PR Curves (LogReg vs LSTM)  -- CPU-only
 # -----------------------------
-# ⬇️ 실제 결과 배열로 교체하세요.
+# ⬇️ Replace with actual result arrays.
 # y_true = np.load('figures/y_true_test.npy')
 # y_score_lr = np.load('figures/y_score_logreg_test.npy')   # predict_proba[:,1] or decision_function normalized
 # y_score_lstm = np.load('figures/y_score_lstm_test.npy')   # sigmoid outputs
 
-# --- Fallback mock (삭제 가능): 형상 확인용 ---
+# --- Fallback mock (can be deleted): for shape verification ---
 np.random.seed(42)
 y_true = np.random.randint(0, 2, 1000)
 y_score_lr = np.clip(y_true + np.random.normal(0, 0.1, 1000), 0, 1)
@@ -64,7 +64,7 @@ print("✅ Saved: figures/roc_curve_cpu.pdf, figures/pr_curve_cpu.pdf")
 # -----------------------------
 # 2) Model Performance Bar Chart (CPU-only, F1@τ* from validation)
 # -----------------------------
-# 논문 표(τ* from validation)와 수치를 일치시킴
+# Match figures with the paper table (τ* from validation)
 models = ['LogReg', 'LinearSVC', 'ExtraTrees', 'GaussianNB', 'MLP', 'LSTM']
 f1_tau =  [0.972,   0.974,       0.998,        0.986,        0.946,  0.934]
 roc_auc  = [0.876,   0.852,       0.994,        0.929,        0.852,  0.858]
