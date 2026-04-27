@@ -1,4 +1,7 @@
 /data/
 /decimal_attack.csv
+/.env
+__pycache__/
+*.py[cod]
 /.venv/
 /.idea
